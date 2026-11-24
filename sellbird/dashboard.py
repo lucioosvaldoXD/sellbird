@@ -2915,7 +2915,7 @@ def _check_loopback_bind(host: str) -> str:
     name = (host or "").strip().lower()
     if name.startswith("[") and name.endswith("]"):
         name = name[1:-1]
-    if not auth.is_loopback(name):
+    if not auth.is_loopback(name) and not (name == "0.0.0.0" and os.environ.get("SELLBIRD_DOCKER_BIND") == "1"):
         raise DashboardSetupError(
             f"Refusing to listen on {host!r}: the dashboard only listens on this machine "
             "(127.0.0.1, ::1 or localhost). To reach it from elsewhere, tunnel instead: "
