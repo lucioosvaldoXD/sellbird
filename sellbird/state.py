@@ -631,7 +631,9 @@ class StateManager:
                     except Exception as exc:
                         if "duplicate column name" not in str(exc).lower():
                             raise
-                        for stmt in script.split(";"):
+                        import re
+                        cleaned = re.sub(r"--[^\n]*", "", script)
+                        for stmt in cleaned.split(";"):
                             stmt = stmt.strip()
                             if not stmt:
                                 continue
