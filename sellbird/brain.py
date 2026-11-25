@@ -10,6 +10,7 @@ other one.
 import asyncio
 import json
 import logging
+import os
 import re
 import time
 from pathlib import Path
@@ -40,7 +41,12 @@ _NON_RETRYABLE_PATTERNS = (
 )
 
 
-PROVIDER_LABELS = {"claude": "Claude", "codex": "Codex"}
+PROVIDER_LABELS = {
+    "claude": "Claude",
+    "codex": "Codex",
+    "openrouter": "OpenRouter",
+    "openai_compatible": "OpenAI-Compatible",
+}
 
 # Settings key holding the brain's last health transition, for `sellbird
 # status` and the dashboard: {"provider", "status": "ok"|"paused", "reason",
@@ -166,6 +172,8 @@ class Brain:
         PROVIDER_RECHECK_SECONDS, so a persistent problem doesn't start
         runtimes every heartbeat.
         """
+        if self.provider in ("openrouter", "openai_compatible"):
+            return await self._api_preflight()
         if self.provider != "codex":
             return await self._claude_preflight()
         from sellbird.codex import CodexError
@@ -207,6 +215,17 @@ class Brain:
                 await self._mark_available()
         return ""
 
+    async def _api_preflight(self) -> str:
+        """OpenRouter / OpenAI-compatible HTTP API preflight."""
+        api_key = os.environ.get("LLM_API_KEY", "").strip()
+        if not api_key or api_key.startswith("replace-with"):
+            err = RuntimeError("LLM_API_KEY missing or placeholder in .env")
+            await self._mark_unavailable(err)
+            return self.unavailable
+        if self.unavailable:
+            await self._mark_available()
+        return ""
+
     async def _claude_preflight(self) -> str:
         """Claude: the installed CLI must support every isolation flag
         (claude_runtime.check_cli). Runs ``claude --help`` only: no login
@@ -225,6 +244,12 @@ class Brain:
     def _fingerprint(self):
         if self.provider == "codex":
             return self.codex.fingerprint()
+        if self.provider in ("openrouter", "openai_compatible"):
+            return (
+                self.provider,
+                self.model or os.environ.get("LLM_MODEL", ""),
+                getattr(self.config, "base_url", "") or os.environ.get("LLM_BASE_URL", ""),
+            )
         from sellbird.claude_runtime import fingerprint
         return fingerprint()
 
@@ -297,6 +322,11 @@ class Brain:
         if self.provider == "codex":
             return await self._think_codex(
                 prompt, session_id=session_id, timeout=timeout,
+                max_retries=max_retries, agent=agent, task=task,
+            )
+        if self.provider in ("openrouter", "openai_compatible"):
+            return await self._think_openai_compatible(
+                prompt, expect_json=expect_json, timeout=timeout,
                 max_retries=max_retries, agent=agent, task=task,
             )
 
@@ -440,6 +470,111 @@ class Brain:
             f"Brain call failed after {max_retries + 1} attempts. "
             f"Last error: {str(last_error)[:200]}"
         )
+        return ""
+
+    async def _think_openai_compatible(
+        self,
+        prompt: str,
+        expect_json: bool = False,
+        timeout: float = DEFAULT_TIMEOUT_SECONDS,
+        max_retries: int = DEFAULT_MAX_RETRIES,
+        agent: str = "",
+        task: str = "",
+    ) -> str:
+        """Call OpenRouter or any OpenAI-compatible /chat/completions endpoint."""
+        import httpx
+
+        api_key = os.environ.get("LLM_API_KEY", "").strip()
+        if not api_key or api_key.startswith("replace-with"):
+            logger.error("OpenRouter/OpenAI-compatible call skipped: LLM_API_KEY not set")
+            return ""
+
+        base_url = (
+            getattr(self.config, "base_url", "").strip()
+            or os.environ.get("LLM_BASE_URL", "").strip()
+            or "https://openrouter.ai/api/v1"
+        ).rstrip("/")
+        model = (
+            self.model
+            or os.environ.get("LLM_MODEL", "").strip()
+            or "google/gemini-2.5-flash"
+        )
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+            "HTTP-Referer": "https://logisentinel.com",
+            "X-Title": "LOGISENTINEL Sellbird",
+        }
+        payload: dict = {
+            "model": model,
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": 0.3,
+        }
+        if expect_json:
+            payload["response_format"] = {"type": "json_object"}
+
+        last_error = ""
+        for attempt in range(max_retries + 1):
+            if attempt > 0:
+                delay = RETRY_BASE_DELAY * (2 ** (attempt - 1))
+                logger.info(
+                    f"Retrying {self.provider_label} call in {delay:.0f}s "
+                    f"(attempt {attempt + 1}/{max_retries + 1})..."
+                )
+                await asyncio.sleep(delay)
+            t0 = time.monotonic()
+            try:
+                async with httpx.AsyncClient(timeout=timeout) as client:
+                    resp = await client.post(
+                        f"{base_url}/chat/completions",
+                        headers=headers,
+                        json=payload,
+                    )
+                if resp.status_code == 400 and expect_json and "response_format" in payload:
+                    # Some OpenRouter/local models reject response_format; retry without it.
+                    payload.pop("response_format", None)
+                    async with httpx.AsyncClient(timeout=timeout) as client:
+                        resp = await client.post(
+                            f"{base_url}/chat/completions",
+                            headers=headers,
+                            json=payload,
+                        )
+                if resp.status_code in (401, 403):
+                    logger.error(f"{self.provider_label} auth error {resp.status_code}: {resp.text[:200]}")
+                    return ""
+                resp.raise_for_status()
+                data = resp.json()
+                text = (
+                    ((data.get("choices") or [{}])[0].get("message") or {}).get("content")
+                    or ""
+                )
+                usage = data.get("usage") or {}
+                duration_ms = int((time.monotonic() - t0) * 1000)
+                try:
+                    await self.state.record_usage_event(
+                        agent=agent,
+                        task=task or "think",
+                        session_id="",
+                        model=str(data.get("model") or model),
+                        input_tokens=int(usage.get("prompt_tokens") or 0),
+                        output_tokens=int(usage.get("completion_tokens") or 0),
+                        cache_read_tokens=0,
+                        cache_creation_tokens=0,
+                        cost_usd=float(usage.get("cost") or 0.0),
+                        duration_ms=duration_ms,
+                        num_turns=1,
+                        is_error=False,
+                        source="openai_compatible",
+                        provider=self.provider,
+                    )
+                except Exception as ue:
+                    logger.debug(f"Usage record skipped: {ue}")
+                return text.strip()
+            except Exception as e:
+                last_error = str(e)
+                logger.warning(f"{self.provider_label} attempt {attempt + 1} failed: {e}")
+
+        logger.error(f"{self.provider_label} failed after {max_retries + 1} attempts: {last_error[:200]}")
         return ""
 
     async def _think_codex(

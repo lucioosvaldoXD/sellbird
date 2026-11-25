@@ -696,7 +696,7 @@ class UsageConfig(BaseModel):
         return v
 
 
-BRAIN_PROVIDERS = ("claude", "codex")
+BRAIN_PROVIDERS = ("claude", "codex", "openrouter", "openai_compatible")
 CODEX_REASONING_EFFORTS = ("minimal", "low", "medium", "high", "xhigh")
 
 # Model names are passed to a CLI, so they must look like a model name and
@@ -715,6 +715,7 @@ class BrainConfig(BaseModel):
 
     provider: str = "claude"
     model: str = ""  # empty = the provider's own default
+    base_url: str = ""  # openrouter / openai_compatible endpoint
     reasoning_effort: str = ""  # codex only; empty = model default
 
     @field_validator("provider", mode="before")
