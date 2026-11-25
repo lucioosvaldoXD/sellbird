@@ -27,6 +27,7 @@ import hashlib
 import http.server
 import json
 import logging
+import os
 import secrets
 import socket
 import time
@@ -292,6 +293,13 @@ class MicrosoftProvider(MailProvider):
                      else {"contentType": "Text", "content": body}),
             "toRecipients": [{"emailAddress": {"address": to_email}}],
         }
+        send_as = os.environ.get("SATELITE_SEND_AS", "").strip()
+        if send_as:
+            sender_obj = {"address": send_as}
+            from_name = os.environ.get("SATELITE_FROM_NAME", "").strip()
+            if from_name:
+                sender_obj["name"] = from_name
+            content["from"] = {"emailAddress": sender_obj}
         draft = None
         try:
             await self._check_identity()
